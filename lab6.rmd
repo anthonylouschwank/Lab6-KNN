@@ -1,0 +1,883 @@
+---
+title: "Laboratorio 5 – Naive Bayes"
+author: "Anggelie Velásquez, Anthony Lou, Isabella Obando"
+date: "27 de marzo de 2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+---
+
+# 1. Librerías y carga de datos
+```{r libraries}
+library(dplyr)
+library(ggplot2)
+library(e1071)       # Naive Bayes
+library(caret)       # confusionMatrix, métricas
+library(rpart)       # para comparar con árbol
+```
+
+```{r load_data}
+load("../../Data/lab5/listings.RData")
+df <- listings
+
+# ── Preprocesamiento (idéntico al Lab 3 y 4) ──────────────────────────────────
+model_df <- listings %>%
+  mutate(
+    price                    = as.numeric(gsub("[$,]", "", price)),
+    is_superhost             = ifelse(host_is_superhost == "t", 1, 0),
+    is_instant_book          = ifelse(instant_bookable  == "t", 1, 0),
+    host_response_rate_num   = as.numeric(gsub("%", "", host_response_rate)),
+    host_acceptance_rate_num = as.numeric(gsub("%", "", host_acceptance_rate)),
+    room_type                = as.factor(room_type)
+  ) %>%
+  select(price, bedrooms, accommodates, bathrooms, beds,
+         review_scores_rating, reviews_per_month,
+         availability_365, minimum_nights,
+         is_superhost, is_instant_book,
+         host_response_rate_num, host_acceptance_rate_num,
+         room_type) %>%
+  filter(!is.na(price), price > 0, price < 1000,
+         !is.na(bedrooms), !is.na(bathrooms), !is.na(beds)) %>%
+  mutate(across(where(is.numeric),
+                ~ ifelse(is.na(.), median(., na.rm = TRUE), .)))
+
+# ── Ingeniería de características ─────────────────────────────────────────────
+model_df <- model_df %>%
+  mutate(
+    price_per_guest  = price / accommodates,
+    beds_per_bedroom = ifelse(bedrooms > 0, beds / bedrooms, beds),
+    size_category    = case_when(
+      accommodates <= 2 ~ "small",
+      accommodates <= 5 ~ "medium",
+      accommodates <= 8 ~ "large",
+      TRUE              ~ "extra_large"
+    ) %>% as.factor(),
+    high_rated        = ifelse(!is.na(review_scores_rating) &
+                               review_scores_rating >= 4.8, 1, 0),
+    high_availability = ifelse(availability_365 > 182, 1, 0)
+  )
+
+# ── Variable respuesta categórica (mismos cortes que Lab 4) ───────────────────
+corte_bajo <- as.numeric(quantile(model_df$price, 0.25))
+corte_alto <- as.numeric(quantile(model_df$price, 0.75))
+
+clasificar_precio <- function(precio, q1, q3) {
+  dplyr::case_when(
+    precio <= q1 ~ "Economica",
+    precio <= q3 ~ "Intermedia",
+    TRUE         ~ "Cara"
+  )
+}
+
+model_df$categoria_precio <- factor(
+  clasificar_precio(model_df$price, corte_bajo, corte_alto),
+  levels = c("Economica", "Intermedia", "Cara")
+)
+
+cat("Dimensiones:", nrow(model_df), "x", ncol(model_df), "\n")
+cat("Corte Q1 (Económica): $", corte_bajo, "\n")
+cat("Corte Q3 (Cara):      $", corte_alto, "\n")
+```
+
+---
+# 2. División Train / Test (misma semilla que Labs anteriores)
+```{r train_test_split}
+set.seed(42)
+
+n         <- nrow(model_df)
+train_idx <- sample(seq_len(n), size = floor(0.70 * n))
+
+train_df <- model_df[ train_idx, ]
+test_df  <- model_df[-train_idx, ]
+
+cat("Total: ", n, "\n")
+cat("Train: ", nrow(train_df), "filas (70%)\n")
+cat("Test:  ", nrow(test_df),  "filas (30%)\n")
+cat("Mediana price Train:", median(train_df$price), "\n")
+cat("Mediana price Test: ", median(test_df$price),  "\n")
+```
+
+---
+# 3. Punto 1 — Naive Bayes para Regresión (precio numérico)
+```{r nb_regresion_setup}
+# Discretizar precio en 20 cuantiles
+breaks_reg <- quantile(train_df$price,
+                       probs = seq(0, 1, length.out = 21),
+                       na.rm = TRUE)
+breaks_reg <- unique(breaks_reg)   # eliminar duplicados si los hay
+
+train_df$price_bin <- cut(train_df$price, breaks = breaks_reg,
+                          include.lowest = TRUE, labels = FALSE)
+test_df$price_bin  <- cut(test_df$price,  breaks = breaks_reg,
+                          include.lowest = TRUE, labels = FALSE)
+
+# Calcular valor central de cada bin (media de precios por bin en train)
+bin_means <- train_df %>%
+  group_by(price_bin) %>%
+  summarise(bin_mean = mean(price, na.rm = TRUE), .groups = "drop")
+
+cat("Número de bins:", length(unique(train_df$price_bin[!is.na(train_df$price_bin)])), "\n")
+cat("Rango de medias de bins: $",
+    round(min(bin_means$bin_mean), 1), "–",
+    round(max(bin_means$bin_mean), 1), "\n")
+```
+```{r nb_regresion_modelo}
+vars_nb <- c("accommodates", "bedrooms", "bathrooms",
+             "review_scores_rating", "reviews_per_month",
+             "availability_365", "minimum_nights",
+             "is_superhost", "is_instant_book",
+             "host_response_rate_num",
+             "high_rated", "high_availability",
+             "beds_per_bedroom", "room_type")
+
+# Convertir price_bin a factor para NB
+train_nb_reg <- train_df[!is.na(train_df$price_bin),
+                          c("price_bin", vars_nb)]
+train_nb_reg$price_bin <- factor(train_nb_reg$price_bin)
+
+set.seed(42)
+nb_reg <- naiveBayes(price_bin ~ ., data = train_nb_reg)
+```
+```{r nb_regresion_prediccion}
+# Predecir bin en test y mapear a valor numérico
+test_nb_reg <- test_df[, vars_nb]
+pred_bin    <- predict(nb_reg, newdata = test_nb_reg)
+pred_bin_num <- as.integer(as.character(pred_bin))
+
+pred_nb_reg <- bin_means$bin_mean[match(pred_bin_num, bin_means$price_bin)]
+
+# Imputar con mediana global si algún bin no tiene correspondencia
+global_median <- median(train_df$price, na.rm = TRUE)
+pred_nb_reg[is.na(pred_nb_reg)] <- global_median
+
+rmse_nb_reg <- sqrt(mean((test_df$price - pred_nb_reg)^2, na.rm = TRUE))
+mae_nb_reg  <- mean(abs(test_df$price - pred_nb_reg),    na.rm = TRUE)
+r2_nb_reg   <- cor(test_df$price, pred_nb_reg,
+                   use = "complete.obs")^2
+
+cat("── Métricas NB Regresión (test) ──\n")
+cat("RMSE:", round(rmse_nb_reg, 2), "\n")
+cat("MAE: ", round(mae_nb_reg,  2), "\n")
+cat("R²:  ", round(r2_nb_reg,   4), "\n")
+```
+
+---
+
+# 4. Punto 2 — Análisis de resultados: NB Regresión
+```{r nb_reg_plots}
+# Predicho vs Real
+par(mar = c(4, 4, 3, 2))
+plot(test_df$price, pred_nb_reg,
+     pch  = 16, col = rgb(0.36, 0.54, 0.72, 0.2),
+     main = "Predicho vs Real — Naive Bayes Regresión",
+     xlab = "Precio real (USD)", ylab = "Precio predicho (USD)",
+     xlim = c(0, 800), ylim = c(0, 800))
+abline(0, 1, col = "#E05C5C", lwd = 2, lty = 2)
+legend("topleft",
+       legend = paste0("R² = ", round(r2_nb_reg, 4)),
+       col = "#E05C5C", lty = 2, lwd = 2, bty = "n")
+
+# Distribución de errores
+errores_nb_reg <- test_df$price - pred_nb_reg
+
+par(mar = c(4, 4, 3, 2))
+hist(errores_nb_reg, breaks = 60,
+     col = "#5B8DB8", border = "white",
+     main = "Distribución de errores — NB Regresión",
+     xlab = "Error (Real − Predicho)", ylab = "Frecuencia")
+abline(v = 0,                    col = "#E05C5C", lwd = 2, lty = 2)
+abline(v = mean(errores_nb_reg), col = "#E8A838", lwd = 2)
+legend("topright",
+       legend = c("Error = 0",
+                  paste0("Media = ", round(mean(errores_nb_reg), 2))),
+       col = c("#E05C5C", "#E8A838"),
+       lty = c(2, 1), lwd = 2, bty = "n")
+
+cat("── Análisis de errores ──\n")
+cat("Error medio:           ", round(mean(errores_nb_reg),   2), "\n")
+cat("Desv. estándar:        ", round(sd(errores_nb_reg),     2), "\n")
+cat("Error mediano:         ", round(median(errores_nb_reg), 2), "\n")
+cat("% predicciones ± $50: ",
+    round(mean(abs(errores_nb_reg) <= 50) * 100, 1), "%\n")
+```
+
+---
+
+# 5. Punto 3 — Comparación con Regresión Lineal y Árbol de Regresión
+
+Se retoman los valores reportados en los labs anteriores con los **mismos
+conjuntos train/test** (`set.seed(42)`, 70/30).
+```{r comparacion_regresion}
+# Regresión lineal múltiple (Lab 3)
+modelo_lm <- lm(price ~ accommodates + bedrooms + bathrooms +
+                  review_scores_rating + reviews_per_month +
+                  availability_365 + minimum_nights +
+                  is_superhost + is_instant_book +
+                  host_response_rate_num +
+                  room_type + high_rated + high_availability,
+                data = train_df)
+
+pred_lm     <- predict(modelo_lm, newdata = test_df)
+rmse_lm     <- sqrt(mean((test_df$price - pred_lm)^2))
+mae_lm      <- mean(abs(test_df$price - pred_lm))
+r2_lm       <- cor(test_df$price, pred_lm)^2
+
+# Árbol de regresión (Lab 4, sin límite de profundidad)
+set.seed(42)
+arbol_reg <- rpart(price ~ .,
+                   data    = train_df[, c("price", vars_nb)],
+                   method  = "anova",
+                   control = rpart.control(cp = 0.001))
+
+pred_arbol   <- predict(arbol_reg, newdata = test_df)
+rmse_arbol   <- sqrt(mean((test_df$price - pred_arbol)^2))
+mae_arbol    <- mean(abs(test_df$price - pred_arbol))
+r2_arbol     <- cor(test_df$price, pred_arbol)^2
+
+# Tabla comparativa
+comparacion_reg <- data.frame(
+  Modelo = c("Regresión Lineal Múltiple",
+             "Árbol de Regresión",
+             "Naive Bayes (bins)"),
+  RMSE   = round(c(rmse_lm,    rmse_arbol,    rmse_nb_reg),  2),
+  MAE    = round(c(mae_lm,     mae_arbol,     mae_nb_reg),   2),
+  R2     = round(c(r2_lm,      r2_arbol,      r2_nb_reg),    4)
+)
+
+cat("══ Comparación de modelos de regresión ══\n")
+print(comparacion_reg)
+
+colores_comp <- c("#5B8DB8", "#E8A838", "#E05C5C")
+par(mar = c(5, 5, 4, 2))
+bp <- barplot(comparacion_reg$RMSE,
+              names.arg = comparacion_reg$Modelo,
+              col = colores_comp, border = "white",
+              ylim = c(0, max(comparacion_reg$RMSE) * 1.25),
+              main = "Comparación RMSE — modelos de regresión (test)",
+              ylab = "RMSE (USD)", las = 2, cex.names = 0.8)
+text(bp, comparacion_reg$RMSE + 1,
+     labels = comparacion_reg$RMSE, cex = 0.85, font = 2)
+
+bp2 <- barplot(comparacion_reg$R2,
+               names.arg = comparacion_reg$Modelo,
+               col = colores_comp, border = "white",
+               ylim = c(0, 1),
+               main = "Comparación R² — modelos de regresión (test)",
+               ylab = "R²", las = 2, cex.names = 0.8)
+text(bp2, comparacion_reg$R2 + 0.02,
+     labels = comparacion_reg$R2, cex = 0.85, font = 2)
+abline(h = 0.5, col = "gray40", lwd = 1, lty = 2)
+
+mejor_reg <- comparacion_reg$Modelo[which.min(comparacion_reg$RMSE)]
+cat("\nModelo con menor RMSE:", mejor_reg, "\n")
+```
+# 6. Punto 4 — Naive Bayes para Clasificación
+
+Variable respuesta: `categoria_precio` (Económica / Intermedia / Cara),
+definida con los mismos cortes Q1 = $`r corte_bajo` y Q3 = $`r corte_alto`.
+El **precio no se incluye** como predictor para evitar data leakage.
+```{r nb_clasificacion}
+vars_clasif <- c("accommodates", "bedrooms", "bathrooms",
+                 "review_scores_rating", "reviews_per_month",
+                 "availability_365", "minimum_nights",
+                 "is_superhost", "is_instant_book",
+                 "host_response_rate_num",
+                 "high_rated", "high_availability",
+                 "beds_per_bedroom", "room_type")
+
+set.seed(42)
+nb_clasif <- naiveBayes(
+  categoria_precio ~ .,
+  data = train_df[, c("categoria_precio", vars_clasif)]
+)
+```
+# 7. Punto 5 — Predicción en conjunto de prueba
+```{r nb_clasif_prediccion}
+pred_nb_clasif <- predict(nb_clasif,
+                          newdata = test_df[, vars_clasif])
+
+# Probabilidades posteriores
+prob_nb_clasif <- predict(nb_clasif,
+                          newdata = test_df[, vars_clasif],
+                          type    = "raw")
+
+cat("── Primeras 6 predicciones con probabilidades ──\n")
+head(data.frame(
+  Real     = test_df$categoria_precio,
+  Predicho = pred_nb_clasif,
+  round(prob_nb_clasif, 3)
+))
+
+acc_nb <- mean(pred_nb_clasif == test_df$categoria_precio)
+cat("\nAccuracy global: ", round(acc_nb * 100, 2), "%\n")
+```
+```{r nb_clasif_dist}
+# Distribución predicha vs real
+par(mfrow = c(1, 2), mar = c(5, 4, 3, 2))
+barplot(prop.table(table(test_df$categoria_precio)) * 100,
+        col = c("#6DBF8E", "#5B8DB8", "#E05C5C"), border = "white",
+        ylim = c(0, 60), las = 2,
+        main = "Distribución real (test)", ylab = "% de registros")
+barplot(prop.table(table(pred_nb_clasif)) * 100,
+        col = c("#6DBF8E", "#5B8DB8", "#E05C5C"), border = "white",
+        ylim = c(0, 60), las = 2,
+        main = "Distribución predicha — NB", ylab = "% de registros")
+par(mfrow = c(1, 1))
+```
+
+---
+
+# 8. Punto 6 — Análisis de eficiencia: Matriz de confusión
+```{r matriz_confusion}
+cm_nb <- confusionMatrix(pred_nb_clasif, test_df$categoria_precio)
+print(cm_nb)
+```
+```{r cm_manual}
+conf_mat_nb <- table(Real = test_df$categoria_precio,
+                     Predicho = pred_nb_clasif)
+
+cat("── Matriz de confusión ──\n")
+print(conf_mat_nb)
+
+cat("\n── Proporciones por fila (tasa de error por clase) ──\n")
+print(round(prop.table(conf_mat_nb, 1), 3))
+```
+```{r metricas_por_clase_nb}
+calcular_f1 <- function(cm, clase) {
+  tp <- cm[clase, clase]
+  fp <- sum(cm[, clase]) - tp
+  fn <- sum(cm[clase, ]) - tp
+  precision <- if ((tp + fp) > 0) tp / (tp + fp) else 0
+  recall    <- if ((tp + fn) > 0) tp / (tp + fn) else 0
+  f1        <- if ((precision + recall) > 0)
+                 2 * precision * recall / (precision + recall) else 0
+  list(precision = precision, recall = recall, f1 = f1)
+}
+
+cat("── Métricas por clase ──\n")
+metricas_nb <- data.frame(
+  Clase     = levels(test_df$categoria_precio),
+  Precision = numeric(3),
+  Recall    = numeric(3),
+  F1        = numeric(3)
+)
+
+for (i in seq_along(metricas_nb$Clase)) {
+  clase <- metricas_nb$Clase[i]
+  m     <- calcular_f1(conf_mat_nb, clase)
+  metricas_nb$Precision[i] <- round(m$precision, 3)
+  metricas_nb$Recall[i]    <- round(m$recall,    3)
+  metricas_nb$F1[i]        <- round(m$f1,        3)
+}
+print(metricas_nb)
+
+cat("\nAccuracy global:", round(acc_nb * 100, 2), "%\n")
+```
+```{r heatmap_confusion}
+# Heatmap de la matriz de confusión
+cm_df <- as.data.frame(conf_mat_nb)
+colnames(cm_df) <- c("Real", "Predicho", "Frecuencia")
+
+ggplot(cm_df, aes(x = Predicho, y = Real, fill = Frecuencia)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Frecuencia), size = 5, fontface = "bold") +
+  scale_fill_gradient(low = "#EAF4FB", high = "#2E6DA4") +
+  labs(title  = "Matriz de confusión — Naive Bayes Clasificación",
+       x      = "Clase predicha",
+       y      = "Clase real",
+       fill   = "Frecuencia") +
+  theme_minimal(base_size = 13)
+```
+```{r cm_errores_analisis}
+# Errores por clase
+cat("── Errores de clasificación por clase ──\n")
+for (clase in levels(test_df$categoria_precio)) {
+  total_real    <- sum(conf_mat_nb[clase, ])
+  correctos     <- conf_mat_nb[clase, clase]
+  errores_clase <- total_real - correctos
+  tasa_error    <- errores_clase / total_real
+
+  cat(sprintf("  %s: %d errores de %d (%.1f%% tasa de error)\n",
+              clase, errores_clase, total_real, tasa_error * 100))
+}
+
+cat("\n── ¿Dónde se equivoca más el modelo? ──\n")
+# Confusiones más frecuentes (fuera de la diagonal)
+for (real in levels(test_df$categoria_precio)) {
+  for (pred in levels(test_df$categoria_precio)) {
+    if (real != pred && conf_mat_nb[real, pred] > 0) {
+      cat(sprintf("  Real=%s → Predicho=%s : %d casos\n",
+                  real, pred, conf_mat_nb[real, pred]))
+    }
+  }
+}
+```
+
+```{r plot_metricas_nb}
+# Gráfico de barras de métricas por clase
+colores_clase <- c("#6DBF8E", "#5B8DB8", "#E05C5C")
+
+metricas_long <- reshape(metricas_nb,
+                         varying   = c("Precision", "Recall", "F1"),
+                         v.names   = "Valor",
+                         timevar   = "Metrica",
+                         times     = c("Precision", "Recall", "F1"),
+                         direction = "long")
+
+ggplot(metricas_long, aes(x = Clase, y = Valor, fill = Clase)) +
+  geom_col(position = "dodge", width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = round(Valor, 3)),
+            vjust = -0.4, size = 3.5, fontface = "bold") +
+  facet_wrap(~ Metrica) +
+  scale_fill_manual(values = colores_clase) +
+  ylim(0, 1.1) +
+  labs(title = "Métricas de clasificación por clase — Naive Bayes",
+       x = "Clase", y = "Valor") +
+  theme_minimal(base_size = 12)
+```
+```{r comparacion_clasificadores}
+# Árbol de clasificación para comparar (mismo setup que Lab 4)
+set.seed(42)
+arbol_clasif_comp <- rpart(
+  categoria_precio ~ .,
+  data    = train_df[, c("categoria_precio", vars_clasif)],
+  method  = "class",
+  control = rpart.control(cp = 0.001, maxdepth = 6)
+)
+pred_arbol_clasif <- predict(arbol_clasif_comp,
+                             newdata = test_df, type = "class")
+acc_arbol         <- mean(pred_arbol_clasif == test_df$categoria_precio)
+
+# Tabla resumen
+comparacion_clasif <- data.frame(
+  Modelo    = c("Árbol de Clasificación (maxdepth=6)", "Naive Bayes"),
+  Accuracy  = round(c(acc_arbol, acc_nb) * 100, 2),
+  F1_Eco    = c(round(calcular_f1(
+                  table(Real     = test_df$categoria_precio,
+                        Predicho = pred_arbol_clasif), "Economica")$f1, 3),
+                metricas_nb$F1[metricas_nb$Clase == "Economica"]),
+  F1_Int    = c(round(calcular_f1(
+                  table(Real     = test_df$categoria_precio,
+                        Predicho = pred_arbol_clasif), "Intermedia")$f1, 3),
+                metricas_nb$F1[metricas_nb$Clase == "Intermedia"]),
+  F1_Cara   = c(round(calcular_f1(
+                  table(Real     = test_df$categoria_precio,
+                        Predicho = pred_arbol_clasif), "Cara")$f1, 3),
+                metricas_nb$F1[metricas_nb$Clase == "Cara"])
+)
+
+cat("══ Comparación clasificadores ══\n")
+print(comparacion_clasif)
+
+par(mar = c(5, 5, 4, 2))
+bp_cl <- barplot(comparacion_clasif$Accuracy,
+                 names.arg = comparacion_clasif$Modelo,
+                 col = c("#E8A838", "#E05C5C"), border = "white",
+                 ylim = c(0, 100),
+                 main = "Accuracy — Árbol vs Naive Bayes (test)",
+                 ylab = "Accuracy (%)", cex.names = 0.85)
+text(bp_cl, comparacion_clasif$Accuracy + 1.5,
+     labels = paste0(comparacion_clasif$Accuracy, "%"),
+     cex = 0.9, font = 2)
+```
+```{r sobreajuste_regresion}
+pred_nb_reg_train <- {
+  pred_bin_train    <- predict(nb_reg, newdata = train_df[, vars_nb])
+  pred_bin_num_tr   <- as.integer(as.character(pred_bin_train))
+  vals              <- bin_means$bin_mean[match(pred_bin_num_tr, bin_means$price_bin)]
+  vals[is.na(vals)] <- global_median
+  vals
+}
+
+rmse_nb_reg_train <- sqrt(mean((train_df$price - pred_nb_reg_train)^2, na.rm = TRUE))
+mae_nb_reg_train  <- mean(abs(train_df$price - pred_nb_reg_train),     na.rm = TRUE)
+r2_nb_reg_train   <- cor(train_df$price, pred_nb_reg_train, use = "complete.obs")^2
+
+cat("── NB Regresión: Train vs Test ──\n")
+cat(sprintf("  RMSE  Train: %.2f  |  Test: %.2f  |  Diferencia: %.2f\n",
+            rmse_nb_reg_train, rmse_nb_reg, rmse_nb_reg - rmse_nb_reg_train))
+cat(sprintf("  MAE   Train: %.2f  |  Test: %.2f\n", mae_nb_reg_train, mae_nb_reg))
+cat(sprintf("  R²    Train: %.4f  |  Test: %.4f\n", r2_nb_reg_train,  r2_nb_reg))
+```
+```{r sobreajuste_clasificacion}
+pred_nb_clasif_train <- predict(nb_clasif,
+                                newdata = train_df[, vars_clasif])
+acc_nb_train <- mean(pred_nb_clasif_train == train_df$categoria_precio)
+
+cat("── NB Clasificación: Train vs Test ──\n")
+cat(sprintf("  Accuracy Train: %.2f%%  |  Test: %.2f%%  |  Diferencia: %.2f pp\n",
+            acc_nb_train * 100, acc_nb * 100,
+            (acc_nb_train - acc_nb) * 100))
+```
+```{r sobreajuste_plots}
+par(mfrow = c(1, 2), mar = c(5, 5, 4, 2))
+
+barplot(c(rmse_nb_reg_train, rmse_nb_reg),
+        names.arg = c("Train", "Test"),
+        col = c("#5B8DB8", "#E05C5C"), border = "white",
+        main = "RMSE Train vs Test\nNB Regresión", ylab = "RMSE (USD)")
+
+barplot(c(acc_nb_train * 100, acc_nb * 100),
+        names.arg = c("Train", "Test"),
+        col = c("#5B8DB8", "#E05C5C"), border = "white",
+        ylim = c(0, 100),
+        main = "Accuracy Train vs Test\nNB Clasificación", ylab = "Accuracy (%)")
+
+par(mfrow = c(1, 1))
+```
+```{r cv_regresion}
+set.seed(42)
+k          <- 5
+folds      <- sample(rep(1:k, length.out = nrow(train_df)))
+rmse_folds <- numeric(k)
+mae_folds  <- numeric(k)
+r2_folds   <- numeric(k)
+
+for (i in 1:k) {
+  fold_train <- train_df[folds != i, ]
+  fold_val   <- train_df[folds == i, ]
+
+  breaks_fold <- unique(quantile(fold_train$price,
+                                 probs = seq(0, 1, length.out = 21),
+                                 na.rm = TRUE))
+  fold_train$price_bin <- cut(fold_train$price, breaks = breaks_fold,
+                               include.lowest = TRUE, labels = FALSE)
+
+  bin_means_fold <- fold_train %>%
+    group_by(price_bin) %>%
+    summarise(bin_mean = mean(price, na.rm = TRUE), .groups = "drop")
+
+  nb_fold <- naiveBayes(price_bin ~ .,
+                        data = fold_train[!is.na(fold_train$price_bin),
+                                          c("price_bin", vars_nb)] %>%
+                          mutate(price_bin = factor(price_bin)))
+
+  pred_fold_bin <- predict(nb_fold, newdata = fold_val[, vars_nb])
+  pred_fold_num <- as.integer(as.character(pred_fold_bin))
+  pred_fold     <- bin_means_fold$bin_mean[match(pred_fold_num,
+                                                  bin_means_fold$price_bin)]
+  pred_fold[is.na(pred_fold)] <- median(fold_train$price, na.rm = TRUE)
+
+  rmse_folds[i] <- sqrt(mean((fold_val$price - pred_fold)^2, na.rm = TRUE))
+  mae_folds[i]  <- mean(abs(fold_val$price - pred_fold),     na.rm = TRUE)
+  r2_folds[i]   <- cor(fold_val$price, pred_fold, use = "complete.obs")^2
+}
+
+rmse_cv_reg <- mean(rmse_folds)
+mae_cv_reg  <- mean(mae_folds)
+r2_cv_reg   <- mean(r2_folds)
+
+cat("── CV Regresión (5-fold) ──\n")
+cat(sprintf("  RMSE medio: %.2f  (±%.2f)\n", rmse_cv_reg, sd(rmse_folds)))
+cat(sprintf("  MAE  medio: %.2f  (±%.2f)\n", mae_cv_reg,  sd(mae_folds)))
+cat(sprintf("  R²   medio: %.4f  (±%.4f)\n", r2_cv_reg,   sd(r2_folds)))
+
+cat("\n── Comparación: hold-out vs CV (Regresión) ──\n")
+cat(sprintf("  Hold-out RMSE: %.2f  |  CV RMSE: %.2f\n", rmse_nb_reg, rmse_cv_reg))
+cat(sprintf("  Hold-out R²:   %.4f  |  CV R²:   %.4f\n", r2_nb_reg,   r2_cv_reg))
+```
+```{r cv_clasificacion}
+set.seed(42)
+acc_folds_clasif <- numeric(k)
+
+for (i in 1:k) {
+  fold_train <- train_df[folds != i, ]
+  fold_val   <- train_df[folds == i, ]
+
+  nb_fold_cl <- naiveBayes(
+    categoria_precio ~ .,
+    data = fold_train[, c("categoria_precio", vars_clasif)]
+  )
+  pred_fold_cl        <- predict(nb_fold_cl, newdata = fold_val[, vars_clasif])
+  acc_folds_clasif[i] <- mean(pred_fold_cl == fold_val$categoria_precio)
+}
+
+acc_cv_clasif <- mean(acc_folds_clasif)
+
+cat("── CV Clasificación (5-fold) ──\n")
+cat(sprintf("  Accuracy medio: %.2f%%  (±%.2f pp)\n",
+            acc_cv_clasif * 100, sd(acc_folds_clasif) * 100))
+
+cat("\n── Comparación: hold-out vs CV (Clasificación) ──\n")
+cat(sprintf("  Hold-out Accuracy: %.2f%%  |  CV Accuracy: %.2f%%\n",
+            acc_nb * 100, acc_cv_clasif * 100))
+```
+```{r cv_plots}
+par(mfrow = c(1, 2), mar = c(4, 5, 4, 2))
+
+plot(1:k, rmse_folds, type = "b", pch = 16,
+     col = "#5B8DB8", lwd = 2, ylim = c(0, max(rmse_folds) * 1.2),
+     main = "RMSE por fold — NB Regresión",
+     xlab = "Fold", ylab = "RMSE (USD)")
+abline(h = rmse_cv_reg, col = "#E05C5C", lwd = 2, lty = 2)
+legend("topright", legend = paste0("Media = ", round(rmse_cv_reg, 2)),
+       col = "#E05C5C", lty = 2, lwd = 2, bty = "n")
+
+plot(1:k, acc_folds_clasif * 100, type = "b", pch = 16,
+     col = "#6DBF8E", lwd = 2, ylim = c(0, 100),
+     main = "Accuracy por fold — NB Clasificación",
+     xlab = "Fold", ylab = "Accuracy (%)")
+abline(h = acc_cv_clasif * 100, col = "#E05C5C", lwd = 2, lty = 2)
+legend("bottomright", legend = paste0("Media = ", round(acc_cv_clasif * 100, 2), "%"),
+       col = "#E05C5C", lty = 2, lwd = 2, bty = "n")
+
+par(mfrow = c(1, 1))
+```
+```{r tuneo_regresion}
+bins_grid       <- c(10, 15, 20, 25, 30)
+resultados_bins <- data.frame(Bins = integer(), RMSE = numeric(),
+                               MAE = numeric(), R2 = numeric())
+
+for (b in bins_grid) {
+  breaks_b <- unique(quantile(train_df$price,
+                               probs = seq(0, 1, length.out = b + 1),
+                               na.rm = TRUE))
+  train_b <- train_df
+  train_b$price_bin <- cut(train_b$price, breaks = breaks_b,
+                            include.lowest = TRUE, labels = FALSE)
+
+  bin_means_b <- train_b %>%
+    group_by(price_bin) %>%
+    summarise(bin_mean = mean(price, na.rm = TRUE), .groups = "drop")
+
+  nb_b <- naiveBayes(
+    price_bin ~ .,
+    data = train_b[!is.na(train_b$price_bin),
+                    c("price_bin", vars_nb)] %>%
+      mutate(price_bin = factor(price_bin))
+  )
+
+  pred_b_bin <- predict(nb_b, newdata = test_df[, vars_nb])
+  pred_b_num <- as.integer(as.character(pred_b_bin))
+  pred_b     <- bin_means_b$bin_mean[match(pred_b_num, bin_means_b$price_bin)]
+  pred_b[is.na(pred_b)] <- global_median
+
+  resultados_bins <- rbind(resultados_bins, data.frame(
+    Bins = b,
+    RMSE = round(sqrt(mean((test_df$price - pred_b)^2, na.rm = TRUE)), 2),
+    MAE  = round(mean(abs(test_df$price - pred_b),     na.rm = TRUE), 2),
+    R2   = round(cor(test_df$price, pred_b, use = "complete.obs")^2,  4)
+  ))
+}
+
+cat("── Tuneo NB Regresión: número de bins ──\n")
+print(resultados_bins)
+
+mejor_bins_idx <- which.min(resultados_bins$RMSE)
+mejor_bins     <- resultados_bins$Bins[mejor_bins_idx]
+cat("\nMejor número de bins:", mejor_bins,
+    "— RMSE:", resultados_bins$RMSE[mejor_bins_idx], "\n")
+```
+```{r tuneo_clasificacion}
+laplace_grid       <- c(0, 0.5, 1, 2, 5)
+resultados_laplace <- data.frame(Laplace = numeric(), Accuracy = numeric(),
+                                  F1_Eco = numeric(), F1_Int = numeric(),
+                                  F1_Cara = numeric())
+
+for (lp in laplace_grid) {
+  nb_lp <- naiveBayes(
+    categoria_precio ~ .,
+    data    = train_df[, c("categoria_precio", vars_clasif)],
+    laplace = lp
+  )
+  pred_lp <- predict(nb_lp, newdata = test_df[, vars_clasif])
+  cm_lp   <- table(Real = test_df$categoria_precio, Predicho = pred_lp)
+  acc_lp  <- sum(diag(cm_lp)) / sum(cm_lp)
+
+  resultados_laplace <- rbind(resultados_laplace, data.frame(
+    Laplace  = lp,
+    Accuracy = round(acc_lp * 100, 2),
+    F1_Eco   = round(calcular_f1(cm_lp, "Economica")$f1,  3),
+    F1_Int   = round(calcular_f1(cm_lp, "Intermedia")$f1, 3),
+    F1_Cara  = round(calcular_f1(cm_lp, "Cara")$f1,       3)
+  ))
+}
+
+cat("── Tuneo NB Clasificación: Laplace smoothing ──\n")
+print(resultados_laplace)
+
+mejor_lp_idx <- which.max(resultados_laplace$Accuracy)
+mejor_lp     <- resultados_laplace$Laplace[mejor_lp_idx]
+cat("\nMejor Laplace:", mejor_lp,
+    "— Accuracy:", resultados_laplace$Accuracy[mejor_lp_idx], "%\n")
+```
+```{r tuneo_plots}
+par(mfrow = c(1, 2), mar = c(5, 5, 4, 2))
+
+plot(resultados_bins$Bins, resultados_bins$RMSE,
+     type = "b", pch = 16, col = "#5B8DB8", lwd = 2,
+     main = "RMSE vs Número de bins\n(NB Regresión)",
+     xlab = "Bins", ylab = "RMSE (USD)")
+points(mejor_bins, resultados_bins$RMSE[mejor_bins_idx],
+       col = "#E05C5C", pch = 18, cex = 2)
+
+plot(resultados_laplace$Laplace, resultados_laplace$Accuracy,
+     type = "b", pch = 16, col = "#6DBF8E", lwd = 2,
+     main = "Accuracy vs Laplace\n(NB Clasificación)",
+     xlab = "Laplace", ylab = "Accuracy (%)", ylim = c(0, 100))
+points(mejor_lp, resultados_laplace$Accuracy[mejor_lp_idx],
+       col = "#E05C5C", pch = 18, cex = 2)
+
+par(mfrow = c(1, 1))
+```
+```{r modelos_tuneados}
+breaks_best <- unique(quantile(train_df$price,
+                                probs = seq(0, 1, length.out = mejor_bins + 1),
+                                na.rm = TRUE))
+train_df$price_bin_best <- cut(train_df$price, breaks = breaks_best,
+                                include.lowest = TRUE, labels = FALSE)
+bin_means_best <- train_df %>%
+  group_by(price_bin_best) %>%
+  summarise(bin_mean = mean(price, na.rm = TRUE), .groups = "drop") %>%
+  rename(price_bin = price_bin_best)
+
+nb_reg_tuned <- naiveBayes(
+  price_bin_best ~ .,
+  data = train_df[!is.na(train_df$price_bin_best),
+                   c("price_bin_best", vars_nb)] %>%
+    mutate(price_bin_best = factor(price_bin_best))
+)
+pred_tuned_bin    <- predict(nb_reg_tuned, newdata = test_df[, vars_nb])
+pred_tuned_num    <- as.integer(as.character(pred_tuned_bin))
+pred_nb_reg_tuned <- bin_means_best$bin_mean[match(pred_tuned_num,
+                                                    bin_means_best$price_bin)]
+pred_nb_reg_tuned[is.na(pred_nb_reg_tuned)] <- global_median
+
+rmse_tuned_reg <- sqrt(mean((test_df$price - pred_nb_reg_tuned)^2, na.rm = TRUE))
+mae_tuned_reg  <- mean(abs(test_df$price - pred_nb_reg_tuned),     na.rm = TRUE)
+r2_tuned_reg   <- cor(test_df$price, pred_nb_reg_tuned, use = "complete.obs")^2
+
+nb_clasif_tuned      <- naiveBayes(
+  categoria_precio ~ .,
+  data    = train_df[, c("categoria_precio", vars_clasif)],
+  laplace = mejor_lp
+)
+pred_nb_clasif_tuned <- predict(nb_clasif_tuned, newdata = test_df[, vars_clasif])
+acc_tuned_clasif     <- mean(pred_nb_clasif_tuned == test_df$categoria_precio)
+
+cat("── Modelo base vs Modelo tuneado ──\n")
+cat(sprintf("  Regresión  — RMSE base: %.2f  |  RMSE tuneado: %.2f\n",
+            rmse_nb_reg, rmse_tuned_reg))
+cat(sprintf("  Regresión  — R²   base: %.4f  |  R²   tuneado: %.4f\n",
+            r2_nb_reg, r2_tuned_reg))
+cat(sprintf("  Clasificación — Accuracy base: %.2f%%  |  tuneado: %.2f%%\n",
+            acc_nb * 100, acc_tuned_clasif * 100))
+```
+```{r comparacion_final_setup}
+library(randomForest)
+
+set.seed(42)
+arbol_final <- rpart(
+  categoria_precio ~ .,
+  data    = train_df[, c("categoria_precio", vars_clasif)],
+  method  = "class",
+  control = rpart.control(cp = 0.001, maxdepth = 6)
+)
+t_arbol_start <- proc.time()
+pred_arbol_f  <- predict(arbol_final, newdata = test_df, type = "class")
+t_arbol_pred  <- (proc.time() - t_arbol_start)["elapsed"]
+acc_arbol_f   <- mean(pred_arbol_f == test_df$categoria_precio)
+cm_arbol_f    <- table(Real = test_df$categoria_precio, Predicho = pred_arbol_f)
+
+set.seed(42)
+t_rf_train <- proc.time()
+rf_final <- randomForest(
+  categoria_precio ~ .,
+  data       = train_df[, c("categoria_precio", vars_clasif)],
+  ntree      = 500,
+  mtry       = floor(sqrt(length(vars_clasif))),
+  importance = TRUE
+)
+t_rf_train_total <- (proc.time() - t_rf_train)["elapsed"]
+
+t_rf_pred_start <- proc.time()
+pred_rf_f       <- predict(rf_final, newdata = test_df)
+t_rf_pred       <- (proc.time() - t_rf_pred_start)["elapsed"]
+acc_rf_f        <- mean(pred_rf_f == test_df$categoria_precio)
+cm_rf_f         <- table(Real = test_df$categoria_precio, Predicho = pred_rf_f)
+
+t_nb_start <- proc.time()
+pred_nb_f  <- predict(nb_clasif_tuned, newdata = test_df[, vars_clasif])
+t_nb_pred  <- (proc.time() - t_nb_start)["elapsed"]
+acc_nb_f   <- mean(pred_nb_f == test_df$categoria_precio)
+cm_nb_f    <- table(Real = test_df$categoria_precio, Predicho = pred_nb_f)
+```
+```{r comparacion_final_tabla}
+comparacion_final <- data.frame(
+  Modelo     = c("Árbol Clasificación (maxdepth=6)",
+                 "Random Forest (500 árboles)",
+                 "Naive Bayes (tuneado)"),
+  Accuracy   = round(c(acc_arbol_f, acc_rf_f, acc_nb_f) * 100, 2),
+  F1_Eco     = round(c(calcular_f1(cm_arbol_f, "Economica")$f1,
+                       calcular_f1(cm_rf_f,    "Economica")$f1,
+                       calcular_f1(cm_nb_f,    "Economica")$f1), 3),
+  F1_Int     = round(c(calcular_f1(cm_arbol_f, "Intermedia")$f1,
+                       calcular_f1(cm_rf_f,    "Intermedia")$f1,
+                       calcular_f1(cm_nb_f,    "Intermedia")$f1), 3),
+  F1_Cara    = round(c(calcular_f1(cm_arbol_f, "Cara")$f1,
+                       calcular_f1(cm_rf_f,    "Cara")$f1,
+                       calcular_f1(cm_nb_f,    "Cara")$f1), 3),
+  Tiempo_pred_s = round(c(t_arbol_pred, t_rf_pred, t_nb_pred), 4)
+)
+
+cat("══ Comparación final de clasificadores ══\n")
+print(comparacion_final)
+
+mejor_global <- comparacion_final$Modelo[which.max(comparacion_final$Accuracy)]
+mas_rapido   <- comparacion_final$Modelo[which.min(comparacion_final$Tiempo_pred_s)]
+cat("\nMejor accuracy:        ", mejor_global)
+cat("\nMás rápido prediciendo:", mas_rapido, "\n")
+```
+```{r comparacion_final_plots}
+colores_final <- c("#E8A838", "#E05C5C", "#5B8DB8")
+
+par(mar = c(6, 5, 4, 2))
+bp_final <- barplot(
+  comparacion_final$Accuracy,
+  names.arg = comparacion_final$Modelo,
+  col = colores_final, border = "white",
+  ylim = c(0, 100),
+  main = "Accuracy — Árbol vs Random Forest vs Naive Bayes",
+  ylab = "Accuracy (%)", las = 2, cex.names = 0.8
+)
+text(bp_final, comparacion_final$Accuracy + 1.5,
+     labels = paste0(comparacion_final$Accuracy, "%"),
+     cex = 0.85, font = 2)
+
+par(mar = c(6, 5, 4, 2))
+bp_tiempo <- barplot(
+  comparacion_final$Tiempo_pred_s,
+  names.arg = comparacion_final$Modelo,
+  col = colores_final, border = "white",
+  main = "Tiempo de predicción (segundos)",
+  ylab = "Segundos", las = 2, cex.names = 0.8
+)
+text(bp_tiempo,
+     comparacion_final$Tiempo_pred_s + max(comparacion_final$Tiempo_pred_s) * 0.02,
+     labels = comparacion_final$Tiempo_pred_s,
+     cex = 0.85, font = 2)
+
+f1_comp <- as.matrix(comparacion_final[, c("F1_Eco", "F1_Int", "F1_Cara")])
+rownames(f1_comp) <- comparacion_final$Modelo
+
+par(mar = c(6, 5, 4, 8))
+barplot(
+  t(f1_comp),
+  beside      = TRUE,
+  col         = c("#6DBF8E", "#5B8DB8", "#E05C5C"),
+  border      = "white",
+  ylim        = c(0, 1),
+  main        = "F1-score por clase — comparación final",
+  ylab        = "F1-score", las = 2, cex.names = 0.75,
+  legend.text = c("Económica", "Intermedia", "Cara"),
+  args.legend = list(x = "topright", bty = "n", inset = c(-0.25, 0))
+)
+```
