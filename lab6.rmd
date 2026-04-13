@@ -1044,3 +1044,122 @@ ggplot(errores_long, aes(x = Clase, y = N, fill = Tipo)) +
   theme_minimal(base_size = 12)
 
 ```
+
+```
+
+# ── Validación cruzada explícita: 5-fold sobre train ──────────────────────────
+library(caret)
+
+set.seed(42)
+k      <- 5
+folds  <- createFolds(train_enc$price, k = k, list = TRUE, returnTrain = FALSE)
+
+# Contenedores de métricas por fold
+rmse_folds_reg   <- numeric(k)
+mae_folds_reg    <- numeric(k)
+r2_folds_reg     <- numeric(k)
+acc_folds_clas   <- numeric(k)
+
+for (i in seq_len(k)) {
+  fold_val_idx   <- folds[[i]]
+  fold_train_enc <- train_enc[-fold_val_idx, ]
+  fold_val_enc   <- train_enc[ fold_val_idx, ]
+
+  # ── Regresión ──────────────────────────────────────────────────────────────
+  m_reg <- train(
+    price ~ . - categoria_precio,
+    data       = fold_train_enc,
+    method     = "knn",
+    preProcess = c("center", "scale"),
+    tuneGrid   = expand.grid(k = modelo_reg3$bestTune$k)  # k óptimo del Modelo 3
+  )
+  pred_fold_reg      <- predict(m_reg, newdata = fold_val_enc)
+  rmse_folds_reg[i]  <- RMSE(pred_fold_reg, fold_val_enc$price)
+  mae_folds_reg[i]   <- MAE(pred_fold_reg,  fold_val_enc$price)
+  r2_folds_reg[i]    <- R2(pred_fold_reg,   fold_val_enc$price)
+
+  # ── Clasificación ──────────────────────────────────────────────────────────
+  m_clas <- train(
+    categoria_precio ~ . - price,
+    data       = fold_train_enc,
+    method     = "knn",
+    preProcess = c("center", "scale"),
+    tuneGrid   = expand.grid(k = modelo_clas3$bestTune$k)  # k óptimo del Modelo 3
+  )
+  pred_fold_clas    <- predict(m_clas, newdata = fold_val_enc)
+  acc_folds_clas[i] <- mean(pred_fold_clas == fold_val_enc$categoria_precio)
+}
+
+# ── Resumen CV regresión ───────────────────────────────────────────────────────
+cv_reg <- data.frame(
+  Fold = paste0("Fold ", seq_len(k)),
+  RMSE = round(rmse_folds_reg, 2),
+  MAE  = round(mae_folds_reg,  2),
+  R2   = round(r2_folds_reg,   4)
+)
+cv_reg <- rbind(cv_reg, data.frame(
+  Fold = "Promedio CV",
+  RMSE = round(mean(rmse_folds_reg), 2),
+  MAE  = round(mean(mae_folds_reg),  2),
+  R2   = round(mean(r2_folds_reg),   4)
+))
+
+cat("── CV Regresión (5-fold) ──\n")
+knitr::kable(cv_reg, caption = "Métricas por fold — KNN Regresión")
+
+# ── Resumen CV clasificación ───────────────────────────────────────────────────
+cv_clas <- data.frame(
+  Fold     = paste0("Fold ", seq_len(k)),
+  Accuracy = round(acc_folds_clas * 100, 2)
+)
+cv_clas <- rbind(cv_clas, data.frame(
+  Fold     = "Promedio CV",
+  Accuracy = round(mean(acc_folds_clas) * 100, 2)
+))
+
+cat("\n── CV Clasificación (5-fold) ──\n")
+knitr::kable(cv_clas, caption = "Accuracy por fold — KNN Clasificación")
+
+# ── Comparación CV vs hold-out (Modelo 3) ─────────────────────────────────────
+comparacion_cv <- data.frame(
+  Evaluación  = c("Hold-out (Modelo 3)", "Validación Cruzada 5-fold"),
+  RMSE_reg    = c(round(rmse_r3,              2), round(mean(rmse_folds_reg), 2)),
+  MAE_reg     = c(round(mae_r3,               2), round(mean(mae_folds_reg),  2)),
+  R2_reg      = c(round(r2_r3,                4), round(mean(r2_folds_reg),   4)),
+  Acc_clas    = c(round(cm3$overall["Accuracy"] * 100, 2),
+                  round(mean(acc_folds_clas)    * 100, 2))
+)
+
+cat("\n── Comparación hold-out vs CV ──\n")
+knitr::kable(comparacion_cv,
+             caption = "Hold-out (Modelo 3) vs Validación Cruzada 5-fold")
+
+# ── Gráficos de CV ────────────────────────────────────────────────────────────
+par(mfrow = c(1, 2), mar = c(4, 5, 4, 2))
+
+plot(seq_len(k), rmse_folds_reg,
+     type = "b", pch = 16, col = "#5B8DB8", lwd = 2,
+     ylim = c(0, max(rmse_folds_reg) * 1.2),
+     main = "RMSE por fold — KNN Regresión",
+     xlab = "Fold", ylab = "RMSE (USD)")
+abline(h = mean(rmse_folds_reg), col = "#E05C5C", lwd = 2, lty = 2)
+abline(h = rmse_r3,              col = "#E8A838", lwd = 2, lty = 3)
+legend("topright",
+       legend = c(paste0("Media CV = ",    round(mean(rmse_folds_reg), 2)),
+                  paste0("Hold-out M3 = ", round(rmse_r3, 2))),
+       col = c("#E05C5C", "#E8A838"), lty = c(2, 3), lwd = 2, bty = "n")
+
+plot(seq_len(k), acc_folds_clas * 100,
+     type = "b", pch = 16, col = "#6DBF8E", lwd = 2,
+     ylim = c(0, 100),
+     main = "Accuracy por fold — KNN Clasificación",
+     xlab = "Fold", ylab = "Accuracy (%)")
+abline(h = mean(acc_folds_clas) * 100,          col = "#E05C5C", lwd = 2, lty = 2)
+abline(h = cm3$overall["Accuracy"] * 100,        col = "#E8A838", lwd = 2, lty = 3)
+legend("bottomright",
+       legend = c(paste0("Media CV = ",    round(mean(acc_folds_clas) * 100, 2), "%"),
+                  paste0("Hold-out M3 = ", round(cm3$overall["Accuracy"] * 100, 2), "%")),
+       col = c("#E05C5C", "#E8A838"), lty = c(2, 3), lwd = 2, bty = "n")
+
+par(mfrow = c(1, 1))
+```
