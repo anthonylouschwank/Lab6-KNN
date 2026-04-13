@@ -881,3 +881,166 @@ barplot(
   args.legend = list(x = "topright", bty = "n", inset = c(-0.25, 0))
 )
 ```
+```{r confusion-matrix-knn-modelo3, echo=TRUE, message=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+
+# ── Matriz de confusión completa — KNN Clasificación (Modelo 3) ───────────────
+
+# Matriz de confusión oficial con caret
+cm_detalle <- confusionMatrix(pred_clas3, test_enc$categoria_precio,
+                               positive = NULL)
+print(cm_detalle)
+
+# Tabla cruda para cálculos manuales
+conf_mat <- table(Real     = test_enc$categoria_precio,
+                  Predicho = pred_clas3)
+
+cat("\n── Matriz de confusión (conteos) ──\n")
+print(conf_mat)
+
+cat("\n── Proporciones por fila (tasa de acierto/error por clase real) ──\n")
+print(round(prop.table(conf_mat, margin = 1), 3))
+
+# ── Métricas por clase ────────────────────────────────────────────────────────
+clases <- levels(test_enc$categoria_precio)
+
+metricas_clase <- data.frame(
+  Clase     = clases,
+  TP        = integer(length(clases)),
+  FP        = integer(length(clases)),
+  FN        = integer(length(clases)),
+  TN        = integer(length(clases)),
+  Precision = numeric(length(clases)),
+  Recall    = numeric(length(clases)),
+  F1        = numeric(length(clases)),
+  Specificity = numeric(length(clases))
+)
+
+for (i in seq_along(clases)) {
+  clase <- clases[i]
+
+  tp <- conf_mat[clase, clase]
+  fp <- sum(conf_mat[, clase]) - tp
+  fn <- sum(conf_mat[clase, ]) - tp
+  tn <- sum(conf_mat) - tp - fp - fn
+
+  precision   <- if ((tp + fp) > 0) tp / (tp + fp) else 0
+  recall      <- if ((tp + fn) > 0) tp / (tp + fn) else 0
+  f1          <- if ((precision + recall) > 0)
+                   2 * precision * recall / (precision + recall) else 0
+  specificity <- if ((tn + fp) > 0) tn / (tn + fp) else 0
+
+  metricas_clase[i, "TP"]          <- tp
+  metricas_clase[i, "FP"]          <- fp
+  metricas_clase[i, "FN"]          <- fn
+  metricas_clase[i, "TN"]          <- tn
+  metricas_clase[i, "Precision"]   <- round(precision,   3)
+  metricas_clase[i, "Recall"]      <- round(recall,      3)
+  metricas_clase[i, "F1"]          <- round(f1,          3)
+  metricas_clase[i, "Specificity"] <- round(specificity, 3)
+}
+
+cat("\n── Métricas por clase ──\n")
+knitr::kable(metricas_clase,
+             caption = "TP, FP, FN, TN y métricas por clase — KNN Clasificación (Modelo 3)")
+
+# ── Métricas globales ─────────────────────────────────────────────────────────
+accuracy  <- sum(diag(conf_mat)) / sum(conf_mat)
+kappa     <- cm_detalle$overall["Kappa"]
+macro_f1  <- mean(metricas_clase$F1)
+w_f1      <- sum(metricas_clase$F1 *
+                   (rowSums(conf_mat) / sum(conf_mat)))
+
+cat("\n── Métricas globales ──\n")
+cat(sprintf("  Accuracy:        %.4f  (%.2f%%)\n", accuracy, accuracy * 100))
+cat(sprintf("  Kappa:           %.4f\n", kappa))
+cat(sprintf("  Macro F1:        %.4f\n", macro_f1))
+cat(sprintf("  Weighted F1:     %.4f\n", w_f1))
+
+# ── Errores detallados por clase ──────────────────────────────────────────────
+cat("\n── Errores de clasificación por clase ──\n")
+for (clase in clases) {
+  total     <- sum(conf_mat[clase, ])
+  correctos <- conf_mat[clase, clase]
+  errores   <- total - correctos
+  tasa      <- errores / total
+  cat(sprintf("  %-12s  %d correctos de %d  |  %d errores  (%.1f%% tasa de error)\n",
+              clase, correctos, total, errores, tasa * 100))
+}
+
+cat("\n── Confusiones más frecuentes (fuera de la diagonal) ──\n")
+for (real in clases) {
+  for (pred in clases) {
+    if (real != pred && conf_mat[real, pred] > 0) {
+      pct <- conf_mat[real, pred] / sum(conf_mat[real, ]) * 100
+      cat(sprintf("  Real=%-12s → Predicho=%-12s : %d casos (%.1f%% del total real)\n",
+                  real, pred, conf_mat[real, pred], pct))
+    }
+  }
+}
+
+# ── Heatmap principal ─────────────────────────────────────────────────────────
+cm_df <- as.data.frame(conf_mat)
+colnames(cm_df) <- c("Real", "Predicho", "Frecuencia")
+
+cm_df <- cm_df %>%
+  group_by(Real) %>%
+  mutate(Pct = round(Frecuencia / sum(Frecuencia) * 100, 1)) %>%
+  ungroup()
+
+ggplot(cm_df, aes(x = Predicho, y = Real, fill = Frecuencia)) +
+  geom_tile(color = "white", linewidth = 1) +
+  geom_text(aes(label = paste0(Frecuencia, "\n(", Pct, "%)")),
+            size = 4.5, fontface = "bold") +
+  scale_fill_gradient(low = "#EAF4FB", high = "#2E6DA4") +
+  labs(title    = "Matriz de Confusión — KNN Clasificación (Modelo 3, k óptimo)",
+       subtitle = paste0("Accuracy = ", round(accuracy * 100, 2),
+                         "%  |  Kappa = ", round(kappa, 4),
+                         "  |  Macro F1 = ", round(macro_f1, 4)),
+       x    = "Clase predicha",
+       y    = "Clase real",
+       fill = "Frecuencia") +
+  theme_minimal(base_size = 13) +
+  theme(plot.subtitle = element_text(color = "gray40"))
+
+# ── Gráfico de métricas por clase ─────────────────────────────────────────────
+metricas_long <- tidyr::pivot_longer(
+  metricas_clase[, c("Clase", "Precision", "Recall", "F1", "Specificity")],
+  cols      = c("Precision", "Recall", "F1", "Specificity"),
+  names_to  = "Metrica",
+  values_to = "Valor"
+)
+
+ggplot(metricas_long, aes(x = Clase, y = Valor, fill = Clase)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = round(Valor, 3)),
+            vjust = -0.4, size = 3.5, fontface = "bold") +
+  facet_wrap(~ Metrica, nrow = 1) +
+  scale_fill_manual(values = c("#6DBF8E", "#5B8DB8", "#E05C5C")) +
+  ylim(0, 1.15) +
+  labs(title = "Precision, Recall, F1 y Specificity por clase — KNN Clasificación",
+       x = "Clase", y = "Valor") +
+  theme_minimal(base_size = 12)
+
+# ── Gráfico de barras de errores por clase ────────────────────────────────────
+errores_df <- data.frame(
+  Clase      = clases,
+  Correctos  = diag(conf_mat),
+  Errores    = rowSums(conf_mat) - diag(conf_mat)
+)
+
+errores_long <- tidyr::pivot_longer(errores_df,
+                                     cols      = c("Correctos", "Errores"),
+                                     names_to  = "Tipo",
+                                     values_to = "N")
+
+ggplot(errores_long, aes(x = Clase, y = N, fill = Tipo)) +
+  geom_col(position = "stack", width = 0.5) +
+  geom_text(aes(label = N),
+            position = position_stack(vjust = 0.5),
+            fontface = "bold", color = "white", size = 4) +
+  scale_fill_manual(values = c("Correctos" = "#5B8DB8", "Errores" = "#E05C5C")) +
+  labs(title = "Correctos vs Errores por clase — KNN Clasificación",
+       x = "Clase", y = "Observaciones", fill = "") +
+  theme_minimal(base_size = 12)
+
+```
